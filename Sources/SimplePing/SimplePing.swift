@@ -147,25 +147,48 @@ public final class SimplePing: @unchecked Sendable {
         }
     }
     
+    /// Resolves the hostname to a socket address
+    /// 
+    /// This method handles three types of input:
+    /// 1. IPv4 addresses (e.g., "192.168.1.1")
+    /// 2. IPv6 addresses (e.g., "2001:db8::1")  
+    /// 3. Domain names (e.g., "example.com")
+    /// 
+    /// For domain names, it uses the system's DNS resolution via getaddrinfo().
     private func resolveHostname(completion: @escaping (Result<Data, Error>) -> Void) {
-        // Try to parse as IP address first
+        // First, try to parse as a direct IP address (faster than DNS lookup)
+        if let directAddress = parseDirectIPAddress() {
+            completion(.success(directAddress))
+            return
+        }
+        
+        // If not a direct IP, resolve the hostname via DNS
+        resolveDomainName(completion: completion)
+    }
+    
+    /// Attempts to parse the hostname as a direct IPv4 or IPv6 address
+    private func parseDirectIPAddress() -> Data? {
+        // Try IPv4 first (more common)
         if let ipv4 = IPv4Address(hostName) {
-            let address = createSocketAddress(from: ipv4)
-            completion(.success(address))
-            return
+            return createSocketAddress(from: ipv4)
         }
         
+        // Try IPv6
         if let ipv6 = IPv6Address(hostName) {
-            let address = createSocketAddress(from: ipv6)
-            completion(.success(address))
-            return
+            return createSocketAddress(from: ipv6)
         }
         
-        // Use getaddrinfo for hostname resolution
+        return nil
+    }
+    
+    /// Resolves a domain name to an IP address using the system's DNS resolver
+    private func resolveDomainName(completion: @escaping (Result<Data, Error>) -> Void) {
+        // Configure DNS resolution hints
         var hints = addrinfo()
-        hints.ai_family = AF_UNSPEC
-        hints.ai_socktype = SOCK_DGRAM
+        hints.ai_family = AF_UNSPEC    // Accept both IPv4 and IPv6
+        hints.ai_socktype = SOCK_DGRAM // UDP socket type (for ICMP)
         
+        // Perform DNS resolution
         var result: UnsafeMutablePointer<addrinfo>?
         let status = getaddrinfo(hostName, nil, &hints, &result)
         
@@ -176,25 +199,34 @@ public final class SimplePing: @unchecked Sendable {
         
         defer { freeaddrinfo(result) }
         
-        // Find the first suitable address
+        // Find the first address that matches our preferred address style
+        if let matchingAddress = findMatchingAddress(from: addrInfo) {
+            completion(.success(matchingAddress))
+        } else {
+            completion(.failure(SimplePingError.noAddressFound))
+        }
+    }
+    
+    /// Finds the first address from DNS results that matches the configured address style
+    private func findMatchingAddress(from addrInfo: UnsafeMutablePointer<addrinfo>) -> Data? {
         var current: UnsafeMutablePointer<addrinfo>? = addrInfo
+        
         while let currentAddr = current {
             let family = currentAddr.pointee.ai_family
             
-            if (addressStyle == .any) ||
-               (addressStyle == .icmpv4 && family == AF_INET) ||
-               (addressStyle == .icmpv6 && family == AF_INET6) {
-                
-                let addressData = Data(bytes: currentAddr.pointee.ai_addr,
-                                     count: Int(currentAddr.pointee.ai_addrlen))
-                completion(.success(addressData))
-                return
+            let isMatchingFamily = (addressStyle == .any) ||
+                                  (addressStyle == .icmpv4 && family == AF_INET) ||
+                                  (addressStyle == .icmpv6 && family == AF_INET6)
+            
+            if isMatchingFamily {
+                return Data(bytes: currentAddr.pointee.ai_addr,
+                           count: Int(currentAddr.pointee.ai_addrlen))
             }
             
             current = currentAddr.pointee.ai_next
         }
         
-        completion(.failure(SimplePingError.noAddressFound))
+        return nil
     }
     
     private func createSocketAddress(from ipv4: IPv4Address) -> Data {
@@ -218,6 +250,10 @@ public final class SimplePing: @unchecked Sendable {
         return Data(bytes: &addr, count: MemoryLayout<sockaddr_in6>.size)
     }
     
+    /// Creates and configures a raw ICMP socket for sending/receiving ping packets
+    /// 
+    /// Raw sockets require special privileges and allow direct access to ICMP protocol.
+    /// This method creates the socket, sets up async reading, and notifies the delegate.
     private func createSocket() {
         guard let hostAddress = hostAddress else {
             handleError(SimplePingError.noAddressFound)
@@ -225,42 +261,51 @@ public final class SimplePing: @unchecked Sendable {
         }
         
         let family = hostAddressFamily
-        let sockType: Int32
-        let proto: Int32
+        let socketType: Int32
+        let protocolType: Int32
         
+        // Configure socket parameters based on IP version
         switch family {
         case sa_family_t(AF_INET):
-            sockType = SOCK_DGRAM
-            proto = IPPROTO_ICMP
+            socketType = SOCK_DGRAM        // Datagram socket for IPv4
+            protocolType = IPPROTO_ICMP    // ICMP protocol for IPv4
         case sa_family_t(AF_INET6):
-            sockType = SOCK_DGRAM
-            proto = IPPROTO_ICMPV6
+            socketType = SOCK_DGRAM        // Datagram socket for IPv6  
+            protocolType = IPPROTO_ICMPV6  // ICMPv6 protocol for IPv6
         default:
             handleError(SimplePingError.socketCreationFailed)
             return
         }
         
-        socketFD = socket(Int32(family), sockType, proto)
+        // Create the raw socket (requires elevated privileges on most systems)
+        socketFD = socket(Int32(family), socketType, protocolType)
         
         guard socketFD >= 0 else {
             handleError(SimplePingError.socketCreationFailed)
             return
         }
         
-        // Set up dispatch source for reading
+        // Set up asynchronous socket reading using Grand Central Dispatch
+        // This allows the app to be notified when ping responses arrive
         source = DispatchSource.makeReadSource(fileDescriptor: socketFD, queue: queue)
+        
+        // When data is available to read, call our readData() method
         source?.setEventHandler { [weak self] in
             self?.readData()
         }
+        
+        // When the source is cancelled, clean up the socket file descriptor
         source?.setCancelHandler { [weak self] in
             if let fd = self?.socketFD, fd >= 0 {
                 close(fd)
                 self?.socketFD = -1
             }
         }
+        
+        // Start monitoring the socket for incoming data
         source?.resume()
         
-        // Notify delegate
+        // Notify the delegate that ping is ready to send packets
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.delegate?.simplePing(self, didStartWithAddress: hostAddress)
@@ -408,54 +453,86 @@ public final class SimplePing: @unchecked Sendable {
         }
     }
     
+    /// Validates an IPv4 ping response packet
+    /// 
+    /// IPv4 packets include both an IP header and ICMP header, so we need to:
+    /// 1. Find where the ICMP header starts within the IPv4 packet
+    /// 2. Extract just the ICMP portion for processing
+    /// 3. Validate the ICMP echo reply fields
     private func validateIPv4PingResponse(_ packet: inout Data, sequenceNumber: inout UInt16) -> Bool {
+        // Find the ICMP header within the IPv4 packet
         guard let icmpOffset = ICMPUtils.icmpHeaderOffset(in: packet),
               packet.count >= icmpOffset + MemoryLayout<ICMPHeader>.size else {
             return false
         }
         
-        // Extract ICMP portion
+        // Extract just the ICMP portion (header + payload)
         let icmpData = packet.subdata(in: icmpOffset..<packet.count)
-        guard let header = icmpData.toICMPHeader() else { return false }
+        guard let icmpHeader = icmpData.toICMPHeader() else { return false }
         
-        // Validate response
-        guard header.type == ICMPType.icmpv4EchoReply,
-              header.code == 0,
-              header.identifier == identifier,
-              validateSequenceNumber(header.sequenceNumber) else {
+        // Validate this is our ping response
+        guard isValidPingResponse(header: icmpHeader, expectedReplyType: ICMPType.icmpv4EchoReply) else {
             return false
         }
         
-        // Remove IPv4 header
+        // Strip the IPv4 header, leaving only ICMP data for the caller
         packet = icmpData
-        sequenceNumber = header.sequenceNumber
+        sequenceNumber = icmpHeader.sequenceNumber
         return true
     }
     
+    /// Validates an IPv6 ping response packet
+    /// 
+    /// IPv6 packets are delivered with the ICMP header at the beginning,
+    /// so no header stripping is needed (the OS handles the IPv6 header).
     private func validateIPv6PingResponse(_ packet: inout Data, sequenceNumber: inout UInt16) -> Bool {
-        guard let header = packet.toICMPHeader() else { return false }
+        guard let icmpHeader = packet.toICMPHeader() else { return false }
         
-        guard header.type == ICMPType.icmpv6EchoReply,
-              header.code == 0,
-              header.identifier == identifier,
-              validateSequenceNumber(header.sequenceNumber) else {
+        // Validate this is our ping response  
+        guard isValidPingResponse(header: icmpHeader, expectedReplyType: ICMPType.icmpv6EchoReply) else {
             return false
         }
         
-        sequenceNumber = header.sequenceNumber
+        sequenceNumber = icmpHeader.sequenceNumber
         return true
     }
     
-    private func validateSequenceNumber(_ sequenceNumber: UInt16) -> Bool {
+    /// Checks if an ICMP header represents a valid ping response for this instance
+    private func isValidPingResponse(header: ICMPHeader, expectedReplyType: UInt8) -> Bool {
+        return header.type == expectedReplyType &&       // Correct reply type (0 for IPv4, 129 for IPv6)
+               header.code == 0 &&                       // Code should always be 0 for echo replies
+               header.identifier == identifier &&        // Must match our unique identifier  
+               validateSequenceNumber(header.sequenceNumber) // Must be a sequence we sent
+    }
+    
+    /// Validates that a received sequence number is one we actually sent
+    /// 
+    /// Sequence numbers are 16-bit values that start at 0 and increment with each ping.
+    /// After 65535, they wrap back to 0. We accept responses for recently sent pings
+    /// to handle out-of-order or delayed network responses.
+    /// 
+    /// - Parameter sequenceNumber: The sequence number from a received ping response
+    /// - Returns: true if this sequence number represents a ping we sent recently
+    private func validateSequenceNumber(_ receivedSequenceNumber: UInt16) -> Bool {
         if nextSequenceNumberHasWrapped {
-            return (nextSequenceNumber &- sequenceNumber) < 120
+            // After wraparound, accept sequence numbers within a reasonable window
+            // This handles the case where we've sent 65536+ pings
+            let difference = nextSequenceNumber &- receivedSequenceNumber
+            return difference < 120  // Accept responses from last ~120 pings
         } else {
-            return sequenceNumber < nextSequenceNumber
+            // Before wraparound, simply check if sequence number is less than next expected
+            return receivedSequenceNumber < nextSequenceNumber
         }
     }
     
+    /// Increments the sequence number for the next ping, handling 16-bit wraparound
+    /// 
+    /// ICMP sequence numbers are 16-bit fields (0-65535). After reaching the maximum,
+    /// they wrap back to 0. We track when this happens to correctly validate responses.
     private func incrementSequenceNumber() {
-        nextSequenceNumber = nextSequenceNumber &+ 1
+        nextSequenceNumber = nextSequenceNumber &+ 1  // Wrapping addition
+        
+        // Track when we've wrapped around from 65535 back to 0
         if nextSequenceNumber == 0 {
             nextSequenceNumberHasWrapped = true
         }

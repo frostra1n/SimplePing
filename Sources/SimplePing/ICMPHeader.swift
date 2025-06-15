@@ -46,77 +46,106 @@ public enum ICMPType {
 /// Utility functions for ICMP operations
 public enum ICMPUtils {
     
-    /// Calculates checksum for ICMP packet (IPv4 only)
-    /// - Parameters:
-    ///   - data: The data to calculate checksum for
+    /// Calculates the Internet Checksum for ICMP packets (IPv4 only)
+    /// 
+    /// The Internet Checksum is calculated by:
+    /// 1. Treating the data as a sequence of 16-bit words in network byte order
+    /// 2. Summing all these words with carry propagation
+    /// 3. Taking the one's complement of the final sum
+    /// 
+    /// - Parameter data: The packet data to calculate checksum for
     /// - Returns: The calculated checksum in network byte order
     public static func calculateChecksum(for data: Data) -> UInt16 {
         guard !data.isEmpty else { return 0xFFFF }
         
-        var sum: UInt32 = 0
-        var index = 0
+        var runningSum: UInt32 = 0
+        var byteIndex = 0
         
-        // Sum all 16-bit words
-        while index < data.count - 1 {
-            let word = UInt16(data[index]) << 8 + UInt16(data[index + 1])
-            sum += UInt32(word)
-            index += 2
+        // Process data in 16-bit chunks (network byte order: big-endian)
+        while byteIndex < data.count - 1 {
+            let highByte = UInt16(data[byteIndex]) << 8
+            let lowByte = UInt16(data[byteIndex + 1])
+            let word = highByte + lowByte
+            runningSum += UInt32(word)
+            byteIndex += 2
         }
         
-        // Handle odd byte if present
-        if index < data.count {
-            let lastByte = UInt16(data[index]) << 8
-            sum += UInt32(lastByte)
+        // Handle any remaining odd byte by padding with zero
+        if byteIndex < data.count {
+            let paddedByte = UInt16(data[byteIndex]) << 8
+            runningSum += UInt32(paddedByte)
         }
         
-        // Add carry bits
-        while (sum >> 16) != 0 {
-            sum = (sum & 0xFFFF) + (sum >> 16)
+        // Fold carry bits back into the sum (handle overflow)
+        while (runningSum >> 16) != 0 {
+            runningSum = (runningSum & 0xFFFF) + (runningSum >> 16)
         }
         
-        // One's complement
-        return UInt16(~sum & 0xFFFF)
+        // Return the one's complement of the final sum
+        return UInt16(~runningSum & 0xFFFF)
     }
     
-    /// Finds the offset of ICMP header in IPv4 packet
-    /// - Parameter packet: The IPv4 packet data
-    /// - Returns: The offset of ICMP header, or nil if not found
+    /// Finds the offset of the ICMP header within an IPv4 packet
+    /// 
+    /// IPv4 packets have a variable-length header (20-60 bytes) followed by the payload.
+    /// For ping packets, the payload is the ICMP header and data.
+    /// This function parses the IPv4 header to find where the ICMP portion begins.
+    /// 
+    /// - Parameter packet: The complete IPv4 packet data received from the network
+    /// - Returns: The byte offset where the ICMP header starts, or nil if not a valid IPv4 ICMP packet
     public static func icmpHeaderOffset(in packet: Data) -> Int? {
-        guard packet.count >= MemoryLayout<IPv4Header>.size + MemoryLayout<ICMPHeader>.size else {
+        // Ensure packet is large enough to contain both IPv4 and ICMP headers
+        let minimumPacketSize = MemoryLayout<IPv4Header>.size + MemoryLayout<ICMPHeader>.size
+        guard packet.count >= minimumPacketSize else { return nil }
+        
+        // Parse the IPv4 header from the beginning of the packet
+        let ipv4Header = packet.withUnsafeBytes { $0.load(as: IPv4Header.self) }
+        
+        // Verify this is an IPv4 packet (version = 4) with ICMP payload (protocol = 1)
+        let ipVersion = (ipv4Header.versionAndHeaderLength & 0xF0) >> 4
+        let protocolICMP: UInt8 = 1
+        guard ipVersion == 4, ipv4Header.`protocol` == protocolICMP else {
             return nil
         }
         
-        let ipHeader = packet.withUnsafeBytes { $0.load(as: IPv4Header.self) }
+        // Calculate IPv4 header length (lower 4 bits * 4 = header length in bytes)
+        let headerLengthWords = ipv4Header.versionAndHeaderLength & 0x0F
+        let ipv4HeaderLength = Int(headerLengthWords) * 4
         
-        // Check if it's IPv4 and ICMP protocol
-        guard (ipHeader.versionAndHeaderLength & 0xF0) == 0x40,
-              ipHeader.`protocol` == 1 else { // IPPROTO_ICMP = 1
+        // Ensure the packet is large enough to contain the full headers
+        guard packet.count >= ipv4HeaderLength + MemoryLayout<ICMPHeader>.size else {
             return nil
         }
         
-        let ipHeaderLength = Int(ipHeader.versionAndHeaderLength & 0x0F) * 4
-        
-        guard packet.count >= ipHeaderLength + MemoryLayout<ICMPHeader>.size else {
-            return nil
-        }
-        
-        return ipHeaderLength
+        return ipv4HeaderLength
     }
 }
 
 // MARK: - Data Extensions for ICMP
 
 extension Data {
-    /// Converts Data to ICMPHeader
+    /// Parses ICMP header from raw packet data
+    /// 
+    /// ICMP headers are 8 bytes with this structure:
+    /// - Type (1 byte): ICMP message type (e.g., 8 = Echo Request, 0 = Echo Reply)
+    /// - Code (1 byte): ICMP message code (usually 0 for Echo Request/Reply)
+    /// - Checksum (2 bytes): Internet checksum of ICMP header + data
+    /// - Identifier (2 bytes): Used to match requests with replies
+    /// - Sequence Number (2 bytes): Incremented for each ping sent
+    /// 
+    /// All multi-byte fields are in network byte order (big-endian).
+    /// 
+    /// - Returns: Parsed ICMPHeader or nil if data is too short
     func toICMPHeader() -> ICMPHeader? {
         guard count >= MemoryLayout<ICMPHeader>.size else { return nil }
         
-        return withUnsafeBytes { bytes in
-            let type = bytes[0]
-            let code = bytes[1]
-            let checksum = UInt16(bytes[2]) << 8 | UInt16(bytes[3])
-            let identifier = UInt16(bytes[4]) << 8 | UInt16(bytes[5])
-            let sequenceNumber = UInt16(bytes[6]) << 8 | UInt16(bytes[7])
+        return withUnsafeBytes { rawBytes in
+            // Parse each field from network byte order (big-endian)
+            let type = rawBytes[0]
+            let code = rawBytes[1]
+            let checksum = UInt16(rawBytes[2]) << 8 | UInt16(rawBytes[3])
+            let identifier = UInt16(rawBytes[4]) << 8 | UInt16(rawBytes[5])
+            let sequenceNumber = UInt16(rawBytes[6]) << 8 | UInt16(rawBytes[7])
             
             return ICMPHeader(
                 type: type,
@@ -130,22 +159,28 @@ extension Data {
 }
 
 extension ICMPHeader {
-    /// Converts ICMPHeader to Data
+    /// Converts ICMP header structure to raw packet data
+    /// 
+    /// Serializes the header fields into network byte order (big-endian) for transmission.
+    /// The resulting 8-byte Data can be sent over the network as part of an ICMP packet.
+    /// 
+    /// - Returns: 8 bytes of data representing the ICMP header in network format
     func toData() -> Data {
-        var data = Data(capacity: MemoryLayout<ICMPHeader>.size)
-        data.append(type)
-        data.append(code)
-        data.append(contentsOf: checksum.toBytes())
-        data.append(contentsOf: identifier.toBytes())
-        data.append(contentsOf: sequenceNumber.toBytes())
-        return data
+        var packetData = Data(capacity: MemoryLayout<ICMPHeader>.size)
+        packetData.append(type)
+        packetData.append(code)
+        packetData.append(contentsOf: checksum.toNetworkBytes())
+        packetData.append(contentsOf: identifier.toNetworkBytes())
+        packetData.append(contentsOf: sequenceNumber.toNetworkBytes())
+        return packetData
     }
 }
 
 // MARK: - Helper Extensions
 
 private extension UInt16 {
-    func toBytes() -> [UInt8] {
+    /// Converts a UInt16 to network byte order (big-endian) bytes
+    func toNetworkBytes() -> [UInt8] {
         return [UInt8(self >> 8), UInt8(self & 0xFF)]
     }
 }
