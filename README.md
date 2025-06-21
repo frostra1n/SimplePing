@@ -18,39 +18,11 @@ A modern Swift implementation of ICMP ping functionality for iOS, macOS, watchOS
 - Xcode 14.0+
 - Swift 5.7+
 
-## Installation
-
-### Swift Package Manager
-
-Add SimplePing to your project using Xcode:
-
-1. In Xcode, go to **File → Add Package Dependencies...**
-2. Enter the repository URL: `https://github.com/yourusername/SimplePing` (replace with your actual repository)
-3. Choose the version rule that fits your needs
-4. Click **Add Package**
-
-Or add it to your `Package.swift` file:
-
-```swift
-dependencies: [
-    .package(url: "https://github.com/yourusername/SimplePing", from: "1.0.0")
-]
-```
-
-Then add it to your target:
-
-```swift
-targets: [
-    .target(
-        name: "YourTarget",
-        dependencies: ["SimplePing"]
-    )
-]
-```
-
 ## Usage
 
 ### Basic Usage
+
+Refer to the available methods for async/await functionality [here](Sources/SimplePing/AsyncSimplePing.swift).
 
 ```swift
 import SimplePing
@@ -243,35 +215,6 @@ Or in Xcode:
 1. Open the package in Xcode
 2. Press `Cmd+U` to run tests
 
-## Migration from Objective-C SimplePing
-
-If you're migrating from the original Objective-C SimplePing:
-
-### Key Differences
-
-1. **Modern Swift API**: Uses Swift naming conventions and patterns
-2. **Network Framework**: Uses Apple's modern Network framework instead of BSD sockets
-3. **Error Handling**: Uses Swift's Error protocol instead of NSError
-4. **Memory Management**: Automatic memory management with ARC
-5. **Thread Safety**: Built-in queue management for thread safety
-
-### Migration Guide
-
-| Objective-C | Swift |
-|-------------|-------|
-| `[[SimplePing alloc] initWithHostName:@"example.com"]` | `SimplePing(hostName: "example.com")` |
-| `[pinger start]` | `pinger.start()` |
-| `[pinger sendPingWithData:nil]` | `pinger.sendPing()` |
-| `[pinger sendPingWithData:data]` | `pinger.sendPing(with: data)` |
-| `[pinger stop]` | `pinger.stop()` |
-
-## Performance Considerations
-
-- The ping operations are performed on a background queue to avoid blocking the main thread
-- Delegate callbacks are delivered on the main queue for UI updates
-- Memory usage is optimized with proper cleanup when stopping
-- Network resources are automatically managed by the Network framework
-
 ## License
 
 This project is available under the same license as the original Apple SimplePing sample code. See the LICENSE file for details.
@@ -282,4 +225,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Credits
 
-Based on the original SimplePing sample code by Apple Inc., completely rewritten in modern Swift with the Network framework.
+Based on the [original SimplePing](https://developer.apple.com/library/archive/samplecode/SimplePing/Introduction/Intro.html) sample code by Apple Inc., completely rewritten in modern Swift with the Network framework.
