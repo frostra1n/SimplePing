@@ -24,6 +24,7 @@ A modern Swift implementation of ICMP ping functionality for iOS, macOS, watchOS
 
 Refer to the available methods for async/await functionality [here](Sources/SimplePing/AsyncSimplePing.swift).
 
+If you want to use the delegate directly:
 ```swift
 import SimplePing
 
