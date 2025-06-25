@@ -61,6 +61,7 @@ public final class AsyncSimplePing: @unchecked Sendable {
     
     // Track pending pings for async/await coordination (protected by queue)
     private var pendingPings: [UInt16: CheckedContinuation<PingResult, Error>] = [:]
+    private var pingStartTimes: [UInt16: Date] = [:]
     private var activePingCount = 0
     
     // MARK: - Initialization
@@ -88,10 +89,25 @@ public final class AsyncSimplePing: @unchecked Sendable {
         startupTask?.cancel()
         
         startupTask = Task {
-            try await withCheckedThrowingContinuation { continuation in
-                let delegate = StartupDelegate(continuation: continuation)
-                simplePing.delegate = delegate
-                simplePing.start()
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                // Start the actual ping startup
+                group.addTask {
+                    try await withCheckedThrowingContinuation { continuation in
+                        let delegate = StartupDelegate(continuation: continuation)
+                        self.simplePing.delegate = delegate
+                        self.simplePing.start()
+                    }
+                }
+                
+                // Add a timeout for the startup process
+                group.addTask {
+                    try await Task.sleep(nanoseconds: UInt64(10 * 1_000_000_000)) // 10 second timeout
+                    throw AsyncPingError.timeout
+                }
+                
+                // Wait for the first task to complete (either success or timeout)
+                try await group.next()
+                group.cancelAll()
             }
         }
         
@@ -128,6 +144,7 @@ public final class AsyncSimplePing: @unchecked Sendable {
                         
                         let sequenceNumber = self.simplePing.nextSequenceNumber
                         self.pendingPings[sequenceNumber] = continuation
+                        self.pingStartTimes[sequenceNumber] = Date()
                         self.simplePing.sendPing(with: data)
                     }
                 }
@@ -225,17 +242,32 @@ public final class AsyncSimplePing: @unchecked Sendable {
                 continuation.resume(throwing: AsyncPingError.cancelled)
             }
             self.pendingPings.removeAll()
+            self.pingStartTimes.removeAll()
             self.activePingCount = 0
         }
     }
     
     // MARK: - Internal Methods
     
-    internal func handlePingResponse(_ result: PingResult) {
+    internal func handlePingResponse(_ sequenceNumber: UInt16, packet: Data) {
         queue.async {
-            guard let continuation = self.pendingPings.removeValue(forKey: result.sequenceNumber) else {
+            guard let continuation = self.pendingPings.removeValue(forKey: sequenceNumber) else {
                 return // Unexpected response or already handled
             }
+            
+            let roundTripTime: TimeInterval?
+            if let startTime = self.pingStartTimes.removeValue(forKey: sequenceNumber) {
+                roundTripTime = Date().timeIntervalSince(startTime)
+            } else {
+                roundTripTime = nil
+            }
+            
+            let result = PingResult(
+                sequenceNumber: sequenceNumber,
+                roundTripTime: roundTripTime,
+                responsePacket: packet
+            )
+            
             self.activePingCount -= 1
             continuation.resume(returning: result)
         }
@@ -246,6 +278,7 @@ public final class AsyncSimplePing: @unchecked Sendable {
             guard let continuation = self.pendingPings.removeValue(forKey: sequenceNumber) else {
                 return // Unexpected error or already handled
             }
+            self.pingStartTimes.removeValue(forKey: sequenceNumber)
             self.activePingCount -= 1
             continuation.resume(throwing: error)
         }
@@ -276,6 +309,7 @@ public enum AsyncPingError: Error, LocalizedError {
 @available(iOS 13.0, macOS 10.15, watchOS 6.0, tvOS 13.0, *)
 private final class StartupDelegate: SimplePingDelegate, @unchecked Sendable {
     private let continuation: CheckedContinuation<Void, Error>
+    private let queue = DispatchQueue(label: "StartupDelegate")
     private var hasCompleted = false
     
     init(continuation: CheckedContinuation<Void, Error>) {
@@ -283,15 +317,45 @@ private final class StartupDelegate: SimplePingDelegate, @unchecked Sendable {
     }
     
     func simplePing(_ pinger: SimplePing, didStartWithAddress address: Data) {
-        guard !hasCompleted else { return }
-        hasCompleted = true
-        continuation.resume()
+        queue.async {
+            guard !self.hasCompleted else { return }
+            self.hasCompleted = true
+            self.continuation.resume()
+        }
     }
     
     func simplePing(_ pinger: SimplePing, didFailWithError error: Error) {
-        guard !hasCompleted else { return }
-        hasCompleted = true
-        continuation.resume(throwing: error)
+        queue.async {
+            guard !self.hasCompleted else { return }
+            self.hasCompleted = true
+            self.continuation.resume(throwing: error)
+        }
+    }
+    
+    // Implement all other delegate methods to ensure proper handling
+    func simplePing(_ pinger: SimplePing, didSendPacket packet: Data, sequenceNumber: UInt16) {
+        // During startup, we don't expect packets to be sent, but if they are, ignore them
+    }
+    
+    func simplePing(_ pinger: SimplePing, didFailToSendPacket packet: Data, sequenceNumber: UInt16, error: Error) {
+        // During startup, treat packet send failures as startup failures
+        queue.async {
+            guard !self.hasCompleted else { return }
+            self.hasCompleted = true
+            self.continuation.resume(throwing: error)
+        }
+    }
+    
+    func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, sequenceNumber: UInt16) {
+        // During startup, we don't expect responses, ignore them
+    }
+    
+    func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, sequenceNumber: UInt16, timeInterval: TimeInterval) {
+        // During startup, we don't expect responses, ignore them
+    }
+    
+    func simplePing(_ pinger: SimplePing, didReceiveUnexpectedPacket packet: Data) {
+        // During startup, ignore unexpected packets
     }
 }
 
@@ -304,25 +368,8 @@ private final class PingDelegate: SimplePingDelegate, @unchecked Sendable {
     }
     
     func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, 
-                   sequenceNumber: UInt16, timeInterval: TimeInterval) {
-        let result = AsyncSimplePing.PingResult(
-            sequenceNumber: sequenceNumber,
-            roundTripTime: timeInterval,
-            responsePacket: packet
-        )
-        
-        asyncPing?.handlePingResponse(result)
-    }
-    
-    func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, 
                    sequenceNumber: UInt16) {
-        let result = AsyncSimplePing.PingResult(
-            sequenceNumber: sequenceNumber,
-            roundTripTime: nil,
-            responsePacket: packet
-        )
-        
-        asyncPing?.handlePingResponse(result)
+        asyncPing?.handlePingResponse(sequenceNumber, packet: packet)
     }
     
     func simplePing(_ pinger: SimplePing, didFailToSendPacket packet: Data, 
@@ -347,6 +394,7 @@ extension AsyncSimplePing {
                 continuation.resume(throwing: error)
             }
             self.pendingPings.removeAll()
+            self.pingStartTimes.removeAll()
             self.activePingCount = 0
         }
     }
