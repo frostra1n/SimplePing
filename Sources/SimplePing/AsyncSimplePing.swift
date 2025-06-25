@@ -1,5 +1,10 @@
 import Foundation
 
+//can you create unit tests for the file in
+//"Sources/SimplePing/AsyncSimplePing.swift" and ensure they all pass with
+//the most strict options ensuring concurrency best practices and avoiding
+//data leaks?
+
 /// A modern async/await wrapper around SimplePing
 /// 
 /// This class provides a Swift Concurrency-friendly interface to SimplePing,
