@@ -95,7 +95,12 @@ public final class AsyncSimplePing: @unchecked Sendable {
                     try await withCheckedThrowingContinuation { continuation in
                         let delegate = StartupDelegate(continuation: continuation)
                         self.simplePing.delegate = delegate
-                        self.simplePing.start()
+                        
+                        // Perform the start operation on the next run loop cycle
+                        // to ensure proper delegate setup before SimplePing attempts callbacks
+                        DispatchQueue.main.async {
+                            self.simplePing.start()
+                        }
                     }
                 }
                 
@@ -311,25 +316,48 @@ private final class StartupDelegate: SimplePingDelegate, @unchecked Sendable {
     private let continuation: CheckedContinuation<Void, Error>
     private let queue = DispatchQueue(label: "StartupDelegate")
     private var hasCompleted = false
+    private var timeoutTask: Task<Void, Never>?
     
     init(continuation: CheckedContinuation<Void, Error>) {
         self.continuation = continuation
+        
+        // Add a failsafe timeout to prevent continuation leaks
+        timeoutTask = Task {
+            try? await Task.sleep(nanoseconds: UInt64(15 * 1_000_000_000)) // 15 second failsafe
+            self.queue.async {
+                guard !self.hasCompleted else { return }
+                self.hasCompleted = true
+                self.continuation.resume(throwing: AsyncPingError.timeout)
+            }
+        }
+    }
+    
+    deinit {
+        timeoutTask?.cancel()
+    }
+    
+    private func completeIfNeeded(with result: Result<Void, Error>) {
+        queue.async {
+            guard !self.hasCompleted else { return }
+            self.hasCompleted = true
+            self.timeoutTask?.cancel()
+            self.timeoutTask = nil
+            
+            switch result {
+            case .success:
+                self.continuation.resume()
+            case .failure(let error):
+                self.continuation.resume(throwing: error)
+            }
+        }
     }
     
     func simplePing(_ pinger: SimplePing, didStartWithAddress address: Data) {
-        queue.async {
-            guard !self.hasCompleted else { return }
-            self.hasCompleted = true
-            self.continuation.resume()
-        }
+        completeIfNeeded(with: .success(()))
     }
     
     func simplePing(_ pinger: SimplePing, didFailWithError error: Error) {
-        queue.async {
-            guard !self.hasCompleted else { return }
-            self.hasCompleted = true
-            self.continuation.resume(throwing: error)
-        }
+        completeIfNeeded(with: .failure(error))
     }
     
     // Implement all other delegate methods to ensure proper handling
@@ -339,11 +367,7 @@ private final class StartupDelegate: SimplePingDelegate, @unchecked Sendable {
     
     func simplePing(_ pinger: SimplePing, didFailToSendPacket packet: Data, sequenceNumber: UInt16, error: Error) {
         // During startup, treat packet send failures as startup failures
-        queue.async {
-            guard !self.hasCompleted else { return }
-            self.hasCompleted = true
-            self.continuation.resume(throwing: error)
-        }
+        completeIfNeeded(with: .failure(error))
     }
     
     func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, sequenceNumber: UInt16) {
@@ -372,9 +396,24 @@ private final class PingDelegate: SimplePingDelegate, @unchecked Sendable {
         asyncPing?.handlePingResponse(sequenceNumber, packet: packet)
     }
     
+    func simplePing(_ pinger: SimplePing, didReceivePingResponsePacket packet: Data, 
+                   sequenceNumber: UInt16, timeInterval: TimeInterval) {
+        asyncPing?.handlePingResponse(sequenceNumber, packet: packet)
+    }
+    
+    func simplePing(_ pinger: SimplePing, didSendPacket packet: Data, sequenceNumber: UInt16) {
+        // Packet was successfully sent, no action needed for async implementation
+        // The response will be handled in didReceivePingResponsePacket
+    }
+    
     func simplePing(_ pinger: SimplePing, didFailToSendPacket packet: Data, 
                    sequenceNumber: UInt16, error: Error) {
         asyncPing?.handlePingError(error, sequenceNumber: sequenceNumber)
+    }
+    
+    func simplePing(_ pinger: SimplePing, didReceiveUnexpectedPacket packet: Data) {
+        // Handle unexpected packets by ignoring them
+        // These are typically ICMP messages not related to our pings
     }
     
     func simplePing(_ pinger: SimplePing, didFailWithError error: Error) {

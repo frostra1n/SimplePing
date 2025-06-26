@@ -1,13 +1,13 @@
 import XCTest
 @testable import SimplePing
 
-// Temporarily disabled to avoid network operations during testing
-// These tests perform actual network calls which cause timeouts in test environment
-/*
+// Re-enabled tests with specific continuation leak test
+// Tests are structured to avoid network dependencies where possible
 @available(iOS 13.0, macOS 10.15, watchOS 6.0, tvOS 13.0, *)
 final class AsyncSimplePingLeakTests: XCTestCase {
     
     private let testHost = "127.0.0.1"
+    private let invalidHost = "invalid.host.that.does.not.exist.example.com"
     
     override func setUp() async throws {
         try await super.setUp()
@@ -15,6 +15,97 @@ final class AsyncSimplePingLeakTests: XCTestCase {
     
     override func tearDown() async throws {
         try await super.tearDown()
+    }
+    
+    // MARK: - Continuation Leak Tests
+    
+    func testStartMethodDoesNotLeakContinuation() async throws {
+        // This test specifically addresses the continuation leak issue
+        let expectation = XCTestExpectation(description: "Start method completes without leaking continuation")
+        
+        let task = Task {
+            let ping = AsyncSimplePing(hostName: invalidHost)
+            
+            do {
+                try await ping.start()
+                // If we get here, the invalid host somehow resolved
+                ping.stop()
+            } catch {
+                // Expected - invalid host should fail, but importantly,
+                // it should fail by throwing an error, not by hanging
+                XCTAssertTrue(error is AsyncPingError || error is SimplePingError,
+                            "Should throw a proper error, not hang")
+            }
+            
+            expectation.fulfill()
+        }
+        
+        // Give the operation a reasonable timeout
+        await fulfillment(of: [expectation], timeout: 20.0)
+        
+        // Cancel the task to ensure cleanup
+        task.cancel()
+    }
+    
+    func testStartMethodWithTimeoutDoesNotHang() async throws {
+        // Test that start() method respects timeout and doesn't hang indefinitely
+        let ping = AsyncSimplePing(hostName: invalidHost)
+        
+        let startTime = Date()
+        
+        do {
+            try await ping.start()
+            ping.stop()
+        } catch {
+            // Expected to fail, but should fail within reasonable time
+            let elapsed = Date().timeIntervalSince(startTime)
+            XCTAssertLessThan(elapsed, 16.0, "Start method should timeout within 16 seconds, not hang indefinitely")
+        }
+    }
+    
+    func testConcurrentStartCallsDoNotLeakContinuations() async throws {
+        // Test that multiple concurrent start calls don't create continuation leaks
+        let ping = AsyncSimplePing(hostName: invalidHost)
+        
+        await withTaskGroup(of: Void.self) { group in
+            // Start multiple concurrent start operations
+            for _ in 0..<5 {
+                group.addTask {
+                    do {
+                        try await ping.start()
+                        ping.stop()
+                    } catch {
+                        // Expected to fail for invalid host
+                    }
+                }
+            }
+        }
+        
+        // If we reach here without hanging, the test passes
+    }
+    
+    func testPingResponseHandling() async throws {
+        // Test that ping responses are properly handled with localhost
+        let config = AsyncSimplePing.Configuration(timeout: 5.0)
+        let ping = AsyncSimplePing(hostName: "127.0.0.1", configuration: config)
+        
+        do {
+            try await ping.start()
+            
+            // Try to send a single ping
+            let result = try await ping.ping()
+            
+            // Verify we got a valid result
+            XCTAssertGreaterThanOrEqual(result.sequenceNumber, 0)
+            XCTAssertGreaterThan(result.responsePacket.count, 0)
+            
+            ping.stop()
+        } catch {
+            // On some systems, ping to localhost might fail due to security restrictions
+            // This is acceptable - the important thing is that it doesn't hang
+            XCTAssertTrue(error is AsyncPingError || error is SimplePingError,
+                        "Should throw a proper error type: \(error)")
+        }
     }
     
     // MARK: - Memory Leak Detection Tests
@@ -599,4 +690,3 @@ extension AsyncSimplePingLeakTests {
         return try await block()
     }
 }
-*/
